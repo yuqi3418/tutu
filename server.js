@@ -1,113 +1,143 @@
 import express from "express";
 import fetch from "node-fetch";
 import JSZip from "jszip";
+import crypto from "crypto";
 
 const app = express();
 
-// 1. 全局配置：允许跨域请求 (防止浏览器或客户端拦截)
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
   next();
 });
 
-app.get("/", (req, res) => {
-  res.send("NovelAI 代理服务已启动并运行正常");
-});
-
-app.get("/generate", async (req, res) => {
-  // 2. 清洗和组装参数，设置安全的默认值
-  const tag = req.query.tag || "1girl, best quality, masterpiece";
-  // 默认加入官方标准的负面提示词，防止崩坏
-  const negative_prompt = req.query.ntg || "nsfw, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry";
-  const shape = req.query.shape; 
-  
-  let width = 1024;
-  let height = 1024;
-
-  if (shape === "portrait") {
-    width = 832; height = 1216;
-  } else if (shape === "landscape") {
-    width = 1216; height = 832;
-  } else if (req.query.size) {
-    const sizeArr = req.query.size.split('x');
-    width = parseInt(sizeArr[0]) || 832;
-    height = parseInt(sizeArr[1]) || 1216;
-  }
-
-  // 防御机制：强制将分辨率对齐到 64 的整数倍，防止 NovelAI 报 400 错误
-  width = Math.round(width / 64) * 64;
-  height = Math.round(height / 64) * 64;
-
-  // 防御机制：限制最大步数，防止请求超时 (Render 免费版对长耗时请求不友好)
-  const steps = Math.min(parseInt(req.query.steps) || 28); 
-  const cfg = parseFloat(req.query.cfg) || 5.0;
-
-  // 防御机制：检查环境变量
-  if (!process.env.API_KEY) {
-    return res.status(500).send("服务器未配置 API_KEY，请去 Render 后台设置。");
-  }
-
+app.get(["/", "/generate"], async (req, res) => {
   try {
-    // 3. 发起请求到最新的官方生成端点
-    const response = await fetch("https://image.novelai.net/ai/generate-image", {
+    if (Object.keys(req.query).length === 0) {
+      return res.send("服务运行中，请通过 Tavo 传入参数调用。");
+    }
+
+    const NAI_KEY = req.query.token;
+    const GIT_TOKEN = req.query.git_token;
+    const GIT_REPO = req.query.git_repo;
+
+    if (!NAI_KEY || !GIT_TOKEN || !GIT_REPO) {
+      return res.status(400).send("参数缺失：请检查 token, git_token, git_repo");
+    }
+
+    const tag = req.query.tag || "1girl";
+    const artist = req.query.artist || "";
+    const finalInput = [tag, artist].filter(Boolean).join(", "); 
+    
+    const model = req.query.model || "nai-diffusion-3";
+    const sampler = req.query.sampler || "k_euler";
+    const steps = parseInt(req.query.steps) || 28;
+    const scale = parseFloat(req.query.scale || req.query.cfg) || 5.0; 
+    const negative_prompt = req.query.negative || "nsfw, lowres";
+    const nocache = req.query.nocache === "1"; 
+
+    let width = 1024; let height = 1024;
+    const sizeParam = req.query.size;
+    if (sizeParam === "竖图") {
+      width = 832; height = 1216;
+    } else if (sizeParam === "横图") {
+      width = 1216; height = 832;
+    } else if (sizeParam && sizeParam.includes('x')) {
+      const sizeArr = sizeParam.split('x');
+      width = parseInt(sizeArr[0]) || 1024;
+      height = parseInt(sizeArr[1]) || 1024;
+    }
+    width = Math.round(width / 64) * 64;
+    height = Math.round(height / 64) * 64;
+
+    const hashStr = `${finalInput}_${model}_${width}x${height}_${steps}_${scale}_${sampler}_${negative_prompt}`;
+    const cacheHash = crypto.createHash('md5').update(hashStr).digest('hex');
+    const fileName = `${cacheHash}.png`;
+    const filePath = `images/${fileName}`; 
+
+    const gitApiUrl = `https://api.github.com/repos/${GIT_REPO}/contents/${filePath}`;
+    const gitHeaders = {
+      'Authorization': `token ${GIT_TOKEN}`,
+      'User-Agent': 'Tavo-Proxy'
+    };
+
+    if (!nocache) {
+      const checkGitRes = await fetch(gitApiUrl, { headers: gitHeaders });
+      if (checkGitRes.status === 200) {
+        console.log(`命中缓存: 返回 ${fileName}`);
+        const gitData = await checkGitRes.json();
+        if (gitData.download_url) {
+          return res.redirect(302, gitData.download_url);
+        }
+      }
+    }
+
+    console.log(`未命中缓存，调用 NovelAI: ${fileName}`);
+
+    // 【核心修复】自动适配 V4/V4.5 极其严苛的 JSON 参数结构
+    const isV4 = model.includes("nai-diffusion-4");
+    const aiParams = { 
+      width, 
+      height, 
+      steps, 
+      scale, 
+      sampler, 
+      negative_prompt 
+    };
+
+    // V4 模型强制要求把词条封进 v4_prompt 对象，否则后端必崩 500
+    if (isV4) {
+      aiParams.v4_prompt = {
+        caption: { base_caption: finalInput, char_captions: [] }
+      };
+      aiParams.v4_negative_prompt = {
+        caption: { base_caption: negative_prompt, char_captions: [] }
+      };
+    }
+
+    const naiRes = await fetch("https://image.novelai.net/ai/generate-image", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.API_KEY}`
+        "Authorization": `Bearer ${NAI_KEY}`
       },
       body: JSON.stringify({
-        input: tag,
-        model: "nai-diffusion-3", // 指定最新的 V3 模型
+        input: finalInput,
+        model: model,
         action: "generate",
-        parameters: {
-          width: width,
-          height: height,
-          steps: steps,
-          scale: cfg,
-          sampler: "k_euler",
-          negative_prompt: negative_prompt
-        }
+        parameters: aiParams
       })
     });
 
-    // 4. 拦截并处理官方报错 (如 401鉴权失败，429限流等)
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`NovelAI 接口拒绝了请求 (状态码 ${response.status}):`, errorText);
-      return res.status(response.status).send(`请求失败: 状态码 ${response.status}, 详情: ${errorText}`);
+    if (!naiRes.ok) {
+      return res.status(naiRes.status).send(`NovelAI 报错: ${await naiRes.text()}`);
     }
 
-    // 5. 核心解压逻辑：只要是 200 成功，就当做二进制 ZIP 流处理
-    const arrayBuffer = await response.arrayBuffer();
+    const arrayBuffer = await naiRes.arrayBuffer();
+    const zip = await JSZip.loadAsync(arrayBuffer);
+    const imageFiles = Object.values(zip.files).filter(f => f.name.endsWith('.png'));
     
-    try {
-      const zip = await JSZip.loadAsync(arrayBuffer);
-      
-      // 找到压缩包里的所有 png 文件
-      const imageFiles = Object.values(zip.files).filter(file => file.name.endsWith('.png'));
-      
-      if (imageFiles.length > 0) {
-        // 取出第一张图片转为 Buffer
-        const imgBuffer = await imageFiles[0].async("nodebuffer");
-        
-        // 禁用浏览器缓存，防止你改了 prompt 看到的还是老图
-        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.setHeader("Content-Type", "image/png");
-        
-        // 直接发送图片二进制数据
-        return res.send(imgBuffer);
-      } else {
-        return res.status(500).send("ZIP 解压成功，但里面没有找到 PNG 图片文件。");
-      }
-    } catch (zipError) {
-      console.error("ZIP 解析失败:", zipError);
-      return res.status(500).send("无法将返回的数据解析为压缩包，可能账户状态异常或 API 策略变更。");
-    }
+    if (imageFiles.length === 0) throw new Error("解压失败，未找到图片");
+    const imgBuffer = await imageFiles[0].async("nodebuffer");
+
+    const base64Img = imgBuffer.toString('base64');
+    
+    fetch(gitApiUrl, {
+      method: 'PUT',
+      headers: { ...gitHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: `Auto-upload: ${fileName}`,
+        content: base64Img
+      })
+    }).catch(err => console.error("Git 上传异常:", err.message));
+
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Content-Type", "image/png");
+    return res.end(imgBuffer);
 
   } catch (error) {
-    console.error("服务器内部错误:", error);
-    res.status(500).send(`服务器内部发生致命错误: ${error.message}`);
+    console.error("服务崩溃:", error);
+    res.status(500).send(`服务端错误: ${error.message}`);
   }
 });
 
