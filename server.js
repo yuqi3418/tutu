@@ -24,7 +24,7 @@ app.get("/generate", async (req, res) => {
 
   try {
     // 建议使用官方端点 api.novelai.net
-    const response = await fetch("https://api.novelai.net/ai/generate-image", {
+    const response = await fetch("https://image.novelai.net/ai/generate-image", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
